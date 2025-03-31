@@ -356,7 +356,7 @@ static struct dev_iommu *dev_iommu_get(struct device *dev)
 	return param;
 }
 
-static void dev_iommu_free(struct device *dev)
+void dev_iommu_free(struct device *dev)
 {
 	struct dev_iommu *param = dev->iommu;
 
@@ -408,14 +408,40 @@ EXPORT_SYMBOL_GPL(dev_iommu_priv_set);
  * Init the dev->iommu and dev->iommu_group in the struct device and get the
  * driver probed
  */
-static int iommu_init_device(struct device *dev, const struct iommu_ops *ops)
+static int iommu_init_device(struct device *dev)
 {
+	const struct iommu_ops *ops;
 	struct iommu_device *iommu_dev;
 	struct iommu_group *group;
 	int ret;
 
 	if (!dev_iommu_get(dev))
 		return -ENOMEM;
+	/*
+	 * For FDT-based systems and ACPI IORT/VIOT, the common firmware parsing
+	 * is buried in the bus dma_configure path. Properly unpicking that is
+	 * still a big job, so for now just invoke the whole thing. The device
+	 * already having a driver bound means dma_configure has already run and
+	 * either found no IOMMU to wait for, or we're in its replay call right
+	 * now, so either way there's no point calling it again.
+	 */
+	if (!dev->driver && dev->bus->dma_configure) {
+		mutex_unlock(&iommu_probe_device_lock);
+		dev->bus->dma_configure(dev);
+		mutex_lock(&iommu_probe_device_lock);
+	}
+	/*
+	 * At this point, relevant devices either now have a fwspec which will
+	 * match ops registered with a non-NULL fwnode, or we can reasonably
+	 * assume that only one of Intel, AMD, s390, PAMU or legacy SMMUv2 can
+	 * be present, and that any of their registered instances has suitable
+	 * ops for probing, and thus cheekily co-opt the same mechanism.
+	 */
+	ops = iommu_fwspec_ops(dev->iommu->fwspec);
+	if (!ops) {
+		ret = -ENODEV;
+		goto err_free;
+	}
 
 	if (!try_module_get(ops->owner)) {
 		ret = -EINVAL;
@@ -525,22 +551,10 @@ DEFINE_MUTEX(iommu_probe_device_lock);
 
 static int __iommu_probe_device(struct device *dev, struct list_head *group_list)
 {
-	const struct iommu_ops *ops;
 	struct iommu_group *group;
 	struct group_device *gdev;
 	int ret;
 
-	/*
-	 * For FDT-based systems and ACPI IORT/VIOT, drivers register IOMMU
-	 * instances with non-NULL fwnodes, and client devices should have been
-	 * identified with a fwspec by this point. Otherwise, we can currently
-	 * assume that only one of Intel, AMD, s390, PAMU or legacy SMMUv2 can
-	 * be present, and that any of their registered instances has suitable
-	 * ops for probing, and thus cheekily co-opt the same mechanism.
-	 */
-	ops = iommu_fwspec_ops(dev_iommu_fwspec_get(dev));
-	if (!ops)
-		return -ENODEV;
 	/*
 	 * Serialise to avoid races between IOMMU drivers registering in
 	 * parallel and/or the "replay" calls from ACPI/OF code via client
@@ -554,9 +568,15 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 	if (dev->iommu_group)
 		return 0;
 
-	ret = iommu_init_device(dev, ops);
+	ret = iommu_init_device(dev);
 	if (ret)
 		return ret;
+	/*
+	 * And if we do now see any replay calls, they would indicate someone
+	 * misusing the dma_configure path outside bus code.
+	 */
+	if (dev->driver)
+		dev_WARN(dev, "late IOMMU probe at driver bind, something fishy here!\n");
 
 	group = dev->iommu_group;
 	gdev = iommu_group_alloc_device(group, dev);
@@ -1767,7 +1787,7 @@ static int iommu_get_def_domain_type(struct iommu_group *group,
 		group->id);
 
 	/*
-	 * Try to recover, drivers are allowed to force IDENITY or DMA, IDENTITY
+	 * Try to recover, drivers are allowed to force IDENTITY or DMA, IDENTITY
 	 * takes precedence.
 	 */
 	if (type == IOMMU_DOMAIN_IDENTITY)
@@ -2857,7 +2877,6 @@ void iommu_fwspec_free(struct device *dev)
 		dev_iommu_fwspec_set(dev, NULL);
 	}
 }
-EXPORT_SYMBOL_GPL(iommu_fwspec_free);
 
 int iommu_fwspec_add_ids(struct device *dev, const u32 *ids, int num_ids)
 {
@@ -3105,6 +3124,11 @@ int iommu_device_use_default_domain(struct device *dev)
 		return 0;
 
 	mutex_lock(&group->mutex);
+	/* We may race against bus_iommu_probe() finalising groups here */
+	if (!group->default_domain) {
+		ret = -EPROBE_DEFER;
+		goto unlock_out;
+	}
 	if (group->owner_cnt) {
 		if (group->domain != group->default_domain || group->owner ||
 		    !xa_empty(&group->pasid_array)) {
